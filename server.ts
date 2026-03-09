@@ -96,13 +96,25 @@ const pool = {
       try {
         const stmt = sqliteDb.prepare(sql);
         
+        const sanitize = (rows: any[]) => {
+          return rows.map(row => {
+            const newRow = { ...row };
+            for (const key in newRow) {
+              if (typeof newRow[key] === 'bigint') {
+                newRow[key] = Number(newRow[key]);
+              }
+            }
+            return newRow;
+          });
+        };
+
         if (sql.trim().toUpperCase().startsWith('SELECT')) {
           const rows = stmt.all(...params);
-          return { rows, rowCount: rows.length };
+          return { rows: sanitize(rows), rowCount: rows.length };
         } else {
           const info = stmt.run(...params);
           if (isInsert && hasReturning) {
-             return { rows: [{ id: info.lastInsertRowid }], rowCount: info.changes };
+             return { rows: [{ id: Number(info.lastInsertRowid) }], rowCount: info.changes };
           }
           return { rows: [], rowCount: info.changes };
         }
