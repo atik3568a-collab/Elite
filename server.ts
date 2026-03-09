@@ -114,6 +114,8 @@ const pool = {
         } else {
           const info = stmt.run(...params);
           if (isInsert && hasReturning) {
+             // For SQLite, we can't easily get the full returned row without a separate query
+             // but we can at least return the ID
              return { rows: [{ id: Number(info.lastInsertRowid) }], rowCount: info.changes };
           }
           return { rows: [], rowCount: info.changes };
@@ -626,6 +628,7 @@ function setupRoutes(app: express.Application) {
   // DB Readiness Middleware
   app.use((req, res, next) => {
     if (!isDbReady && req.path.startsWith('/api') && !req.path.startsWith('/api/health')) {
+      console.log(`[DB Not Ready] Blocking request to ${req.path}`);
       return res.status(503).json({ 
         error: 'Database initializing', 
         message: 'Please wait a moment while the database connects.' 
@@ -1488,7 +1491,7 @@ function setupRoutes(app: express.Application) {
         console.error('Failed to initialize Vite middleware:', e);
       }
     })();
-  } else {
+  } else if (!process.env.VERCEL) {
     console.log('Serving static files from dist...');
     app.use(express.static(path.join(__dirname, 'dist')));
     app.get('*', (req, res) => {
@@ -1511,25 +1514,38 @@ async function startInitialization() {
   
   try {
     console.log('Starting background DB initialization...');
-    await Promise.race([initDb(), timeout(10000)]);
+    // No timeout for initDb, it should fail fast anyway if it can't connect
+    await initDb();
     console.log('Database initialized.');
     
-    await Promise.race([runMigrations(), timeout(10000)]);
+    // Migrations are critical, give them some time
+    await Promise.race([runMigrations(), timeout(20000)]);
     console.log('Migrations run.');
     
-    await Promise.race([seedAdmin(), timeout(10000)]);
-    console.log('Admin seeded.');
-    
-    await Promise.race([seedSettings(), timeout(10000)]);
-    console.log('Settings seeded.');
-    
-    await Promise.race([seedTournaments(), timeout(10000)]);
-    console.log('Tournaments seeded.');
-    
+    // Set ready as soon as migrations are done
     isDbReady = true;
-    console.log('✅ Database fully ready!');
+    console.log('✅ Database basic setup ready!');
+    
+    // Seeding can happen in the background without blocking the app
+    try {
+      await Promise.race([seedAdmin(), timeout(10000)]);
+      console.log('Admin seeded.');
+      
+      await Promise.race([seedSettings(), timeout(10000)]);
+      console.log('Settings seeded.');
+      
+      await Promise.race([seedTournaments(), timeout(10000)]);
+      console.log('Tournaments seeded.');
+    } catch (seedErr) {
+      console.warn('⚠️ Seeding warning (non-critical):', seedErr);
+    }
+    
+    console.log('✅ Database fully initialized!');
   } catch (err) {
     console.error('❌ Critical: Database initialization failed:', err);
+    // Even if it fails, we might want to set isDbReady to true 
+    // if we want the app to at least try to handle requests (e.g. if tables already exist)
+    // But for now, we keep it false to show the 503 error which is more informative than a crash
   }
 }
 

@@ -3,6 +3,7 @@ import MainApp from './pages/MainApp';
 import { getFirebaseDb, initFirebase } from './services/firebase';
 import { ref, onValue, off } from 'firebase/database';
 import IntroScreen from './components/IntroScreen';
+import ErrorBoundary from './components/ErrorBoundary';
 
 export interface User {
   id: number;
@@ -147,11 +148,11 @@ export default function App() {
   const [showIntro, setShowIntro] = useState(true);
 
   return (
-    <>
+    <ErrorBoundary>
       {showIntro && <IntroScreen onComplete={() => setShowIntro(false)} />}
       <AuthProvider>
         <MainApp />
       </AuthProvider>
-    </>
+    </ErrorBoundary>
   );
 }

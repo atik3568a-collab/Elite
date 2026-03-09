@@ -3416,8 +3416,8 @@ const AuthModal = () => {
         } else {
           const text = await res.text();
           console.error("Invalid response from server:", text);
-          if (text.includes('Starting Server') || text.includes('<!doctype html>')) {
-             toast.error("Server is starting up. Please wait a moment and try again.");
+          if (text.includes('Starting Server') || text.includes('<!doctype html>') || text.includes('Database initializing')) {
+             toast.error("Server is starting up or database is initializing. Please wait a moment and try again.");
           } else {
              toast.error("Received invalid response from server");
           }
@@ -3805,7 +3805,7 @@ const SimulatePaymentPage = () => {
 
 // --- Main App ---
 
-export default function App() {
+export default function MainApp() {
   const isSimulation = window.location.pathname === '/simulate-payment';
   if (isSimulation) return <SimulatePaymentPage />;
 
