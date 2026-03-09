@@ -31,9 +31,10 @@ let sqliteDb: any;
 let dbType: 'postgres' | 'sqlite' = 'postgres';
 
 const initSqlite = () => {
-  console.log('⚠️ Initializing SQLite database (local.db)...');
+  const dbPath = process.env.VERCEL ? '/tmp/local.db' : 'local.db';
+  console.log(`⚠️ Initializing SQLite database (${dbPath})...`);
   try {
-    sqliteDb = new Database('local.db');
+    sqliteDb = new Database(dbPath);
     dbType = 'sqlite';
     console.log('✅ SQLite initialized successfully.');
   } catch (err) {
@@ -433,8 +434,6 @@ const initDb = async () => {
 
 // Migrations
 const runMigrations = async () => {
-  if (!isDbReady) return;
-  
   try {
     const client = await pool.connect();
     try {
@@ -468,7 +467,6 @@ const runMigrations = async () => {
 
 // Seed Default Admin
 const seedAdmin = async () => {
-  if (!isDbReady) return;
   try {
     const res = await pool.query('SELECT id FROM users WHERE email = $1', ['admin@eliteff.com']);
     if (res.rows.length === 0) {
@@ -486,7 +484,6 @@ const seedAdmin = async () => {
 
 // Seed Firebase Config
 const seedSettings = async () => {
-  if (!isDbReady) return;
   try {
     const firebaseConfig = {
       apiKey: "AIzaSyBr0bf5OYNlYhv_nzgQDxoa_yyWcqmx8F4",
@@ -517,7 +514,7 @@ const seedSettings = async () => {
 };
 
 // Ensure uploads directory exists
-const uploadsDir = 'uploads';
+const uploadsDir = process.env.VERCEL ? '/tmp/uploads' : 'uploads';
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
@@ -529,7 +526,6 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 const seedTournaments = async () => {
-  if (!isDbReady) return;
   try {
     const res = await pool.query('SELECT COUNT(*) as count FROM tournaments');
     const count = parseInt(res.rows[0].count);
@@ -547,8 +543,8 @@ const seedTournaments = async () => {
   }
 };
 
-async function startServer(app: express.Application) {
-  console.log('Starting server initialization...');
+function setupRoutes(app: express.Application) {
+  console.log('Configuring routes...');
   
   const PORT = 3000;
 
@@ -626,34 +622,7 @@ async function startServer(app: express.Application) {
     next();
   });
 
-  // Start initialization in background
-  (async () => {
-    const timeout = (ms: number) => new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms));
-    
-    try {
-      console.log('Starting background DB initialization...');
-      await Promise.race([initDb(), timeout(10000)]);
-      console.log('Database initialized.');
-      
-      await Promise.race([runMigrations(), timeout(10000)]);
-      console.log('Migrations run.');
-      
-      await Promise.race([seedAdmin(), timeout(10000)]);
-      console.log('Admin seeded.');
-      
-      await Promise.race([seedSettings(), timeout(10000)]);
-      console.log('Settings seeded.');
-      
-      await Promise.race([seedTournaments(), timeout(10000)]);
-      console.log('Tournaments seeded.');
-      
-      isDbReady = true;
-      console.log('✅ Database fully ready!');
-    } catch (err) {
-      console.error('❌ Critical: Database initialization failed:', err);
-      // We don't exit process here so the server stays up to report the error
-    }
-  })();
+  // Background initialization will be started separately
   
   // ... (rest of the file)
 
@@ -1494,17 +1463,19 @@ async function startServer(app: express.Application) {
 
   if ((process.env.NODE_ENV !== 'production' || !distExists) && !process.env.VERCEL) {
     console.log('Initializing Vite middleware...');
-    try {
-      const vite = await createViteServer({
-        server: { middlewareMode: true },
-        appType: 'spa',
-      });
-      app.use(vite.middlewares);
-      console.log('Vite middleware initialized.');
-    } catch (e) {
-      console.error('Failed to initialize Vite middleware:', e);
-      throw e;
-    }
+    // Vite initialization remains async but we don't await it here
+    (async () => {
+      try {
+        const vite = await createViteServer({
+          server: { middlewareMode: true },
+          appType: 'spa',
+        });
+        app.use(vite.middlewares);
+        console.log('Vite middleware initialized.');
+      } catch (e) {
+        console.error('Failed to initialize Vite middleware:', e);
+      }
+    })();
   } else {
     console.log('Serving static files from dist...');
     app.use(express.static(path.join(__dirname, 'dist')));
@@ -1523,6 +1494,33 @@ async function startServer(app: express.Application) {
   return app;
 }
 
+async function startInitialization() {
+  const timeout = (ms: number) => new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms));
+  
+  try {
+    console.log('Starting background DB initialization...');
+    await Promise.race([initDb(), timeout(10000)]);
+    console.log('Database initialized.');
+    
+    await Promise.race([runMigrations(), timeout(10000)]);
+    console.log('Migrations run.');
+    
+    await Promise.race([seedAdmin(), timeout(10000)]);
+    console.log('Admin seeded.');
+    
+    await Promise.race([seedSettings(), timeout(10000)]);
+    console.log('Settings seeded.');
+    
+    await Promise.race([seedTournaments(), timeout(10000)]);
+    console.log('Tournaments seeded.');
+    
+    isDbReady = true;
+    console.log('✅ Database fully ready!');
+  } catch (err) {
+    console.error('❌ Critical: Database initialization failed:', err);
+  }
+}
+
 // Global error handlers
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
@@ -1533,9 +1531,7 @@ process.on('uncaughtException', (error) => {
 });
 
 const app = express();
-startServer(app).catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+setupRoutes(app);
+startInitialization();
 
 export default app;
