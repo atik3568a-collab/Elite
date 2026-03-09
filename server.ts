@@ -547,10 +547,9 @@ const seedTournaments = async () => {
   }
 };
 
-async function startServer() {
+async function startServer(app: express.Application) {
   console.log('Starting server initialization...');
   
-  const app = express();
   const PORT = 3000;
 
   app.use(cors());
@@ -1493,7 +1492,7 @@ async function startServer() {
   const distExists = fs.existsSync(path.join(__dirname, 'dist'));
   console.log(`Dist exists: ${distExists}, NODE_ENV: ${process.env.NODE_ENV}`);
 
-  if (process.env.NODE_ENV !== 'production' || !distExists) {
+  if ((process.env.NODE_ENV !== 'production' || !distExists) && !process.env.VERCEL) {
     console.log('Initializing Vite middleware...');
     try {
       const vite = await createViteServer({
@@ -1514,10 +1513,12 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    console.log(`Environment: ${process.env.NODE_ENV}`);
-  });
+  if (!process.env.VERCEL) {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+      console.log(`Environment: ${process.env.NODE_ENV}`);
+    });
+  }
 
   return app;
 }
@@ -1531,9 +1532,10 @@ process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
 });
 
-const appPromise = startServer().catch(err => {
+const app = express();
+startServer(app).catch(err => {
   console.error('Failed to start server:', err);
   process.exit(1);
 });
 
-export default appPromise;
+export default app;
