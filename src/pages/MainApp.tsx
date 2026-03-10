@@ -51,7 +51,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Toaster, toast } from 'react-hot-toast';
 import { format } from 'date-fns';
 import { getFirebaseDb, isFirebaseConfigured, initFirebase } from '../services/firebase';
-import { ref, push, onValue, serverTimestamp, query, limitToLast, update, set, remove } from 'firebase/database';
+import { ref, push, onValue, serverTimestamp, query, limitToLast, update, set, remove, off } from 'firebase/database';
 
 // --- Types ---
 interface Tournament {
@@ -2106,7 +2106,10 @@ const AdminDashboard = ({ onTournamentCreated }: { onTournamentCreated: () => vo
           id: tournamentId,
           filled_slots: 0,
           status: 'upcoming',
-          created_at: serverTimestamp()
+          created_at: serverTimestamp(),
+          last_updated: serverTimestamp()
+        }).then(() => {
+          console.log("Tournament synced to Firebase");
         }).catch(e => console.error("Firebase sync error:", e));
       }
 
@@ -2246,15 +2249,18 @@ const AdminDashboard = ({ onTournamentCreated }: { onTournamentCreated: () => vo
     if (res.ok) {
       toast.success('User updated successfully!');
       
-      // Update Firebase RTDB for real-time sync if user has a UID
+      // Update Firebase RTDB for real-time sync if user has an email
       const db = getFirebaseDb();
-      const targetUid = editingUser.uid;
-      if (db && targetUid) {
-        update(ref(db, `users/${targetUid}`), {
+      if (db && editingUser.email) {
+        const sanitizedEmail = editingUser.email.replace(/\./g, ',');
+        update(ref(db, `users_by_email/${sanitizedEmail}`), {
           name: editingUser.name,
           ign: editingUser.ign,
           profile_photo_url: editingUser.profile_photo_url,
-          is_verified: editingUser.is_verified ? 1 : 0
+          is_verified: editingUser.is_verified ? 1 : 0,
+          wallet_balance: editingUser.wallet_balance,
+          bonus_balance: editingUser.bonus_balance,
+          winning_balance: editingUser.winning_balance
         }).catch(e => console.error("Firebase sync error:", e));
       }
       
@@ -3390,18 +3396,24 @@ const AuthModal = () => {
           if (view === 'login' || view === 'register') {
             login(data.token, data.user);
             
-            // If registering, push initial profile to RTDB
-            if (view === 'register' && data.user.uid) {
-              const db = getFirebaseDb();
-              if (db) {
-                update(ref(db, `users/${data.user.uid}`), {
-                  name: data.user.name,
-                  email: data.user.email,
-                  ign: data.user.ign || '',
-                  profile_photo_url: data.user.profile_photo_url || '',
-                  is_verified: 0
-                }).catch(e => console.error("Firebase register sync error:", e));
-              }
+            // Sync profile to RTDB on every login/register to ensure persistence
+            const db = getFirebaseDb();
+            if (db && data.user.email) {
+              const sanitizedEmail = data.user.email.replace(/\./g, ',');
+              update(ref(db, `users_by_email/${sanitizedEmail}`), {
+                id: data.user.id,
+                name: data.user.name,
+                email: data.user.email,
+                phone: data.user.phone,
+                wallet_balance: data.user.wallet_balance,
+                bonus_balance: data.user.bonus_balance,
+                winning_balance: data.user.winning_balance,
+                role: data.user.role,
+                ign: data.user.ign || '',
+                profile_photo_url: data.user.profile_photo_url || '',
+                is_verified: data.user.is_verified || 0,
+                last_login: serverTimestamp()
+              }).catch(e => console.error("Firebase auth sync error:", e));
             }
             
             toast.success(view === 'login' ? 'Welcome back!' : 'Account created!');
@@ -3416,10 +3428,10 @@ const AuthModal = () => {
         } else {
           const text = await res.text();
           console.error("Invalid response from server:", text);
-          if (text.includes('Starting Server') || text.includes('<!doctype html>') || text.includes('Database initializing')) {
-             toast.error("Server is starting up or database is initializing. Please wait a moment and try again.");
+          if (text.includes('Starting Server') || text.includes('<!doctype html>') || text.includes('Database initializing') || text.includes('Please wait')) {
+             toast.error("Server is waking up. Please wait 5-10 seconds and try again.", { duration: 5000 });
           } else {
-             toast.error("Received invalid response from server");
+             toast.error("Connection error. Please try again in a few seconds.");
           }
         }
       } else {
@@ -3809,10 +3821,9 @@ export default function MainApp() {
   const isSimulation = window.location.pathname === '/simulate-payment';
   if (isSimulation) return <SimulatePaymentPage />;
 
-  const { user, loading, refreshUser } = useAuth();
+  const { user, loading, firebaseInitialized, refreshUser } = useAuth();
   const [activeTab, setActiveTab] = useState('home');
   const [tournaments, setTournaments] = useState<Tournament[]>([]);
-  const [isFirebaseReady, setIsFirebaseReady] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   useEffect(() => {
@@ -3841,31 +3852,24 @@ export default function MainApp() {
   useEffect(() => {
     if (user) {
       fetchTournaments();
-      checkFirebase();
     }
-  }, [user]);
+  }, [user?.id]);
 
-  const checkFirebase = async () => {
-    // Always fetch the latest config from the database on initialization
-    try {
-      const res = await apiFetch('/api/settings/firebase');
-      if (res.ok) {
-        const config = await res.json();
-        if (config) {
-          const { db } = await initFirebase(config);
-          if (db) {
-            // Add real-time listener for tournaments to update UI instantly
-            onValue(ref(db, 'tournaments'), () => {
-              fetchTournaments();
-            });
-          }
-        }
-      }
-    } catch (e) {
-      console.error("Failed to fetch firebase config:", e);
-    }
-    setIsFirebaseReady(true);
-  };
+  useEffect(() => {
+    if (!firebaseInitialized) return;
+    
+    const db = getFirebaseDb();
+    if (!db) return;
+
+    const tournamentsRef = ref(db, 'tournaments');
+    const unsubscribe = onValue(tournamentsRef, () => {
+      fetchTournaments();
+    });
+
+    return () => {
+      off(tournamentsRef);
+    };
+  }, [firebaseInitialized]);
 
   const fetchTournaments = async () => {
     const res = await apiFetch('/api/tournaments');
@@ -3884,10 +3888,19 @@ export default function MainApp() {
     if (res.ok) {
       // Sync to Firebase for real-time updates
       const db = getFirebaseDb();
-      if (db) {
+      if (db && user) {
         update(ref(db, `tournaments/${tournamentId}`), {
           last_join: serverTimestamp()
         }).catch(e => console.error("Firebase sync error:", e));
+        
+        // Also sync user wallet after joining
+        const sanitizedEmail = user.email.replace(/\./g, ',');
+        update(ref(db, `users_by_email/${sanitizedEmail}`), {
+          wallet_balance: user.wallet_balance,
+          bonus_balance: user.bonus_balance,
+          winning_balance: user.winning_balance,
+          last_updated: serverTimestamp()
+        }).catch(e => console.error("Firebase user sync error:", e));
       }
       toast.success('Joined successfully!');
       refreshUser();

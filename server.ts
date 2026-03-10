@@ -11,6 +11,7 @@ import multer from 'multer';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import Stripe from 'stripe';
+import admin from 'firebase-admin';
 
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
@@ -54,6 +55,50 @@ if (connectionString) {
   console.log('⚠️ DATABASE_URL not found or invalid. Falling back to SQLite.');
   initSqlite();
 }
+
+// Firebase Admin Initialization
+let firebaseAdminApp: admin.app.App | null = null;
+const initFirebaseAdmin = (config: any) => {
+  if (firebaseAdminApp) return;
+  try {
+    firebaseAdminApp = admin.initializeApp({
+      credential: admin.credential.cert(config),
+      databaseURL: config.databaseURL || `https://${config.projectId}-default-rtdb.firebaseio.com`
+    }, 'admin-app');
+    console.log('✅ Firebase Admin initialized');
+  } catch (err) {
+    console.error('❌ Firebase Admin init error:', err);
+  }
+};
+
+// Sync helper
+const syncToFirebase = async (path: string, data: any) => {
+  try {
+    const res = await pool.query('SELECT value FROM settings WHERE key = $1', ['firebase_config']);
+    if (res.rows.length > 0) {
+      const config = JSON.parse(res.rows[0].value);
+      const dbUrl = config.databaseURL || `https://${config.projectId}-default-rtdb.firebaseio.com`;
+      
+      // If path starts with users/, we might want to use email for better persistence on Vercel
+      let finalPath = path;
+      if (path.startsWith('users/') && data.email) {
+        const sanitizedEmail = data.email.replace(/\./g, ',');
+        finalPath = `users_by_email/${sanitizedEmail}`;
+      }
+
+      // Use REST API for simplicity if admin SDK is not configured with service account
+      const url = `${dbUrl.replace(/\/$/, '')}/${finalPath}.json`;
+      await fetch(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      console.log(`✅ Firebase Synced: ${finalPath}`);
+    }
+  } catch (err) {
+    console.error(`❌ Firebase Sync Error (${path}):`, err);
+  }
+};
 
 // Unified pool interface
 const pool = {
@@ -114,13 +159,15 @@ const pool = {
         } else {
           const info = stmt.run(...params);
           if (isInsert && hasReturning) {
-             // For SQLite, we can't easily get the full returned row without a separate query
-             // but we can at least return the ID
              return { rows: [{ id: Number(info.lastInsertRowid) }], rowCount: info.changes };
           }
           return { rows: [], rowCount: info.changes };
         }
-      } catch (err) {
+      } catch (err: any) {
+        // Silence duplicate column errors for SQLite to keep logs clean
+        if (err.message && err.message.includes('duplicate column name')) {
+          return { rows: [], rowCount: 0 };
+        }
         console.error("SQLite Query Error:", err);
         throw err;
       }
@@ -152,13 +199,15 @@ const initDb = async () => {
   try {
     if (dbType === 'postgres') {
       try {
-        // Check connection
-        const client = await realPool.connect();
+        // Check connection with a timeout
+        const client = await Promise.race([
+          realPool.connect(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timeout')), 5000))
+        ]) as any;
         client.release();
         console.log('✅ Connected to Postgres successfully.');
       } catch (err) {
-        console.error('❌ Failed to connect to Postgres:', err);
-        console.log('🔄 Switching to SQLite fallback...');
+        console.warn('⚠️ Postgres connection failed, using SQLite fallback.');
         initSqlite();
       }
     }
@@ -691,6 +740,22 @@ function setupRoutes(app: express.Application) {
       const user = userRes.rows[0];
       const token = jwt.sign(user, JWT_SECRET, { expiresIn: '7d' });
       
+      // Sync to Firebase for persistence across devices on Vercel
+      await syncToFirebase(`users/${user.id}`, {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        wallet_balance: user.wallet_balance,
+        bonus_balance: user.bonus_balance,
+        winning_balance: user.winning_balance,
+        role: user.role,
+        uid: user.uid || '',
+        ign: user.ign || '',
+        is_verified: user.is_verified,
+        created_at: new Date().toISOString()
+      });
+
       res.cookie('token', token, { httpOnly: true, secure: true, sameSite: 'none' });
       res.json({ user, token });
     } catch (err: any) {
@@ -709,6 +774,23 @@ function setupRoutes(app: express.Application) {
         return res.status(401).json({ error: 'Invalid credentials' });
       }
       const token = jwt.sign({ id: user.id, name: user.name, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+      
+      // Sync to Firebase on login
+      await syncToFirebase(`users/${user.id}`, {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        wallet_balance: user.wallet_balance,
+        bonus_balance: user.bonus_balance,
+        winning_balance: user.winning_balance,
+        role: user.role,
+        uid: user.uid || '',
+        ign: user.ign || '',
+        is_verified: user.is_verified,
+        last_login: new Date().toISOString()
+      });
+
       res.cookie('token', token, { httpOnly: true, secure: true, sameSite: 'none' });
       res.json({ 
         user: { 
@@ -999,6 +1081,14 @@ function setupRoutes(app: express.Application) {
         'UPDATE users SET wallet_balance = $1, bonus_balance = $2, winning_balance = $3 WHERE id = $4',
         [newWallet, newBonus, newWinning, req.user.id]
       );
+      
+      // Sync to Firebase
+      await syncToFirebase(`users/${req.user.id}`, {
+        wallet_balance: newWallet,
+        bonus_balance: newBonus,
+        winning_balance: newWinning,
+        last_updated: new Date().toISOString()
+      });
       await client.query(
         'INSERT INTO tournament_participants (tournament_id, user_id, player_names) VALUES ($1, $2, $3)',
         [req.params.id, req.user.id, JSON.stringify(playerNames)]
@@ -1250,6 +1340,19 @@ function setupRoutes(app: express.Application) {
         // If there are winnings, update user balance and record transaction
         if (r.winnings > 0) {
           await client.query('UPDATE users SET winning_balance = winning_balance + $1 WHERE id = $2', [r.winnings, r.user_id]);
+          
+          // Sync to Firebase
+          const userRes = await client.query('SELECT * FROM users WHERE id = $1', [r.user_id]);
+          if (userRes.rows.length > 0) {
+            const u = userRes.rows[0];
+            await syncToFirebase(`users/${u.id}`, {
+              wallet_balance: u.wallet_balance,
+              bonus_balance: u.bonus_balance,
+              winning_balance: u.winning_balance,
+              last_updated: new Date().toISOString()
+            });
+          }
+
           await client.query(
             'INSERT INTO wallet_transactions (user_id, type, amount, description) VALUES ($1, $2, $3, $4)',
             [r.user_id, 'prize', r.winnings, `Prize for tournament: ${tournamentId}`]
@@ -1301,6 +1404,19 @@ function setupRoutes(app: express.Application) {
       
       if (status === 'approved') {
         await client.query('UPDATE users SET wallet_balance = wallet_balance + $1 WHERE id = $2', [payment.amount, payment.user_id]);
+        
+        // Sync to Firebase
+        const userRes = await client.query('SELECT * FROM users WHERE id = $1', [payment.user_id]);
+        if (userRes.rows.length > 0) {
+          const u = userRes.rows[0];
+          await syncToFirebase(`users/${u.id}`, {
+            wallet_balance: u.wallet_balance,
+            bonus_balance: u.bonus_balance,
+            winning_balance: u.winning_balance,
+            last_updated: new Date().toISOString()
+          });
+        }
+
         await client.query(
           'INSERT INTO wallet_transactions (user_id, type, amount, description) VALUES ($1, $2, $3, $4)',
           [payment.user_id, 'deposit', payment.amount, 'Deposit approved']
@@ -1478,7 +1594,6 @@ function setupRoutes(app: express.Application) {
 
   if ((process.env.NODE_ENV !== 'production' || !distExists) && !process.env.VERCEL) {
     console.log('Initializing Vite middleware...');
-    // Vite initialization remains async but we don't await it here
     (async () => {
       try {
         const vite = await createViteServer({
